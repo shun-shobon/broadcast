@@ -1,9 +1,10 @@
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::main]
@@ -13,7 +14,7 @@ async fn main() {
     let peers = Arc::new(Mutex::new(HashMap::new()));
 
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, addr, peers.clone()));
+        tokio::spawn(handle_connection(stream, addr, Arc::clone(&peers)));
     }
 }
 
@@ -24,34 +25,43 @@ async fn handle_connection(
 ) {
     let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (mut write, read) = ws_stream.split();
+    peers.lock().await.insert(addr, tx);
+    let (mut write, mut read) = ws_stream.split();
 
-    peers.lock().unwrap().insert(addr, tx);
+    let clone_peers = Arc::clone(&peers);
 
-    let clone_peers = peers.clone();
-    tokio::spawn(read.try_for_each(move |msg| {
-        if let Message::Text(msg) = msg {
-            let peers = clone_peers.lock().unwrap();
+    let rx_fut = async move {
+        while let Some(Ok(msg)) = read.next().await {
+            if let Message::Text(msg) = msg {
+                let peers = clone_peers.lock().await;
 
-            let receivers = peers.iter().filter_map(|(peer_addr, receiver)| {
-                if peer_addr != &addr {
-                    Some(receiver)
-                } else {
-                    None
+                let senders = peers
+                    .iter()
+                    .filter(|(&peer_addr, _)| peer_addr != addr)
+                    .map(|(_, sender)| sender);
+
+                for tx in senders {
+                    tx.send(msg.clone()).unwrap();
                 }
-            });
-
-            for rx in receivers {
-                rx.send(msg.clone()).unwrap();
             }
         }
+    };
 
-        async { Ok(()) }
-    }));
+    tokio::pin!(rx_fut);
 
-    while let Some(msg) = rx.recv().await {
-        write.send(Message::Text(msg)).await.unwrap();
+    loop {
+        tokio::select! {
+            _ = &mut rx_fut => {
+                // 受信側のWebSocketが切れた
+                break;
+            }
+
+            Some(msg) = rx.recv() => {
+                // 他のWebSocketから通信が来た
+                write.send(Message::Text(msg)).await.unwrap();
+            }
+        }
     }
 
-    peers.lock().unwrap().remove(&addr).unwrap();
+    peers.lock().await.remove(&addr).unwrap();
 }
